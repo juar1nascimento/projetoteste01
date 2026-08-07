@@ -7,7 +7,8 @@ import streamlit as st
 import streamlit.components.v1 as components
 import barcode
 from barcode.writer import ImageWriter
-from streamlit_gsheets import GSheetsConnection
+import gspread
+from google.oauth2.service_account import Credentials
 
 # -----------------------------------------------------------------------------
 # Configuração da Página
@@ -18,51 +19,62 @@ st.set_page_config(
     layout="wide"
 )
 
+# --- URL DA PLANILHA GOOGLE ---
+SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/13awqdg1h2sMrlMxE-Mg77EPlZHN-UAlYKEnw2xJo26o/edit?gid=0#gid=0"
+
 # -----------------------------------------------------------------------------
-# Conexão com Google Sheets
+# Autenticação e Conexão Nativa com Google Sheets (gspread)
 # -----------------------------------------------------------------------------
+def obter_credenciais():
+    """Busca as credenciais no secrets.toml com tolerância a diferentes formatos de chave."""
+    if "connections" in st.secrets and "gsheets" in st.secrets["connections"]:
+        return dict(st.secrets["connections"]["gsheets"])
+    elif "gsheets" in st.secrets:
+        return dict(st.secrets["gsheets"])
+    else:
+        return dict(st.secrets)
+
 @st.cache_resource
-def get_sheet_connection():
+def get_gspread_client():
+    """Autentica na API do Google Sheets usando as credenciais do secrets.toml."""
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    
     try:
-        return st.connection("gsheets", type=GSheetsConnection)
+        creds_dict = obter_credenciais()
+        creds = Credentials.from_service_account_info(
+            creds_dict,
+            scopes=scopes
+        )
+        return gspread.authorize(creds)
     except Exception as e:
-        st.error(f"Erro ao conectar com o Google Sheets: {e}")
+        st.error(f"Erro ao autenticar no Google Sheets: {e}")
         return None
 
-conn = get_sheet_connection()
-
 def salvar_no_google_sheets(codigo: str, origem: str, descricao: str = "") -> bool:
-    """Envia um registro de leitura/digitação diretamente para a planilha do Google Sheets."""
-    if conn is None:
-        st.error("Conexão com a planilha indisponível. Verifique as credenciais no arquivo secrets.toml.")
+    """Insere um novo registro como linha no final da planilha Google."""
+    client = get_gspread_client()
+    if client is None:
+        st.error("Falha na autenticação da Service Account. Verifique o arquivo .streamlit/secrets.toml.")
         return False
         
     try:
-        # Lê os dados existentes da planilha
-        try:
-            df_atual = conn.read(ttl=0)
-        except Exception:
-            df_atual = None
-
-        if df_atual is None or df_atual.empty:
-            df_atual = pd.DataFrame(columns=["Data_Hora", "Codigo", "Origem", "Descricao"])
-        else:
-            # Preserva os códigos de barras como texto/string para não perder zeros à esquerda
-            df_atual["Codigo"] = df_atual["Codigo"].astype(str)
-
-        # Prepara a nova linha a ser adicionada
-        novo_registro = pd.DataFrame([{
-            "Data_Hora": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "Codigo": str(codigo),
-            "Origem": origem,
-            "Descricao": descricao
-        }])
+        sheet = client.open_by_url(SPREADSHEET_URL).sheet1
         
-        # Concatena e envia de volta para o Google Sheets
-        df_atualizado = pd.concat([df_atual, novo_registro], ignore_index=True)
-        conn.update(data=df_atualizado)
+        # Garante cabeçalhos se a planilha estiver totalmente vazia
+        if len(sheet.get_all_values()) == 0:
+            sheet.append_row(["Data_Hora", "Codigo", "Origem", "Descricao"])
+
+        nova_linha = [
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            str(codigo),
+            origem,
+            descricao
+        ]
         
-        # Limpa o cache para que a atualização reflita na aba de consulta
+        sheet.append_row(nova_linha)
         st.cache_data.clear()
         return True
 
@@ -70,11 +82,24 @@ def salvar_no_google_sheets(codigo: str, origem: str, descricao: str = "") -> bo
         st.error(f"Falha ao salvar os dados na planilha Google: {str(e)}")
         return False
 
+@st.cache_data(ttl=5)
+def carregar_dados_planilha():
+    """Lê os dados gravados na planilha Google."""
+    client = get_gspread_client()
+    if client is None:
+        return pd.DataFrame()
+    try:
+        sheet = client.open_by_url(SPREADSHEET_URL).sheet1
+        records = sheet.get_all_records()
+        return pd.DataFrame(records)
+    except Exception as e:
+        st.error(f"Erro ao carregar dados da planilha: {e}")
+        return pd.DataFrame()
+
 # -----------------------------------------------------------------------------
 # Funções Utilitárias de Código de Barras
 # -----------------------------------------------------------------------------
 def decode_barcode(image_bytes):
-    """Decodifica código de barras de uma imagem utilizando OpenCV."""
     image_bytes.seek(0)
     file_bytes = np.asarray(bytearray(image_bytes.read()), dtype=np.uint8)
     img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
@@ -90,7 +115,6 @@ def decode_barcode(image_bytes):
     return results, img
 
 def generate_barcode(code_type, code_value):
-    """Gera a imagem do código de barras em memória."""
     barcode_class = barcode.get_barcode_class(code_type)
     rv = io.BytesIO()
     code_instance = barcode_class(code_value, writer=ImageWriter())
@@ -232,12 +256,8 @@ with tab_sheets:
         st.cache_data.clear()
         st.rerun()
         
-    if conn:
-        try:
-            df_sheets = conn.read(ttl=0)
-            if df_sheets is not None and not df_sheets.empty:
-                st.dataframe(df_sheets, use_container_width=True)
-            else:
-                st.info("Nenhum dado encontrado na planilha ainda.")
-        except Exception as e:
-            st.error(f"Erro ao ler os dados da planilha: {e}")
+    df_sheets = carregar_dados_planilha()
+    if not df_sheets.empty:
+        st.dataframe(df_sheets, use_container_width=True)
+    else:
+        st.info("Nenhum dado encontrado ou planilha vazia.")
